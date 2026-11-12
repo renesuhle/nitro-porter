@@ -286,6 +286,9 @@ return [
         'DateUpdated' => 'datetime',
         'UpdateUserID' => 'int',
         'AllowMultiple' => 'tinyint',  // Added 2026-07 for Discord
+        'MaxVotes' => 'int',
+        'AllowChangeVote' => 'tinyint',
+        'HideVotes' => 'tinyint',
         'DateClosed' => 'datetime', // Added 2026-07 for Discord
     ],
     'PollOption' => [
