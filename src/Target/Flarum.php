@@ -49,6 +49,11 @@ class Flarum extends Target
     /** @var int Offset for inserting PMs into posts table. */
     protected int $messagePostOffset = 0;
 
+    /** @var int Offset for source tags so they do not collide with forum tags. */
+    protected int $tagIdOffset = 0;
+
+    protected bool $importSourceTags = false;
+
     /** Standard precheck for issues that will break the import. */
     public function validate(): void
     {
@@ -209,7 +214,7 @@ class Flarum extends Target
     /** 'Tags' in Flarum. */
     protected function categories(): Component
     {
-        return new Component([
+        $transformations = [
             new Transformation(
                 outputSchemaName: 'tags',
                 data: $this->porterQB()->from('Category')->select()
@@ -232,7 +237,30 @@ class Flarum extends Target
                     'ParentCategoryID' => fn($val, $name, $row) => (-1 === $val) ? null : $val, // Root cat is null ID.
                 ],
             ),
-        ]);
+        ];
+
+        if ($this->hasPortSchema('Tag') && $this->hasPortSchema('TagDiscussion')) {
+            $this->importSourceTags = true;
+            $categoryMax = $this->porterQB()->from('Category')->max('CategoryID') ?? 0;
+            $targetMax = $this->hasOutputSchema('tags') ? $this->getMaxValue('id', 'tags') : 0;
+            $this->tagIdOffset = $targetMax + (int)$categoryMax;
+            $transformations[] = new Transformation(
+                outputSchemaName: 'tags',
+                data: 'Tag',
+                map: [
+                    'TagID' => 'id',
+                    'Name' => 'name',
+                    'FullName' => 'slug',
+                ],
+                filters: [
+                    'TagID' => fn($val) => $val + $this->tagIdOffset,
+                    'FullName' => fn($val, $name, $row) =>
+                        Formatter::instance()->toUrl($val ?? $row['Name'] ?? 'tag') . '-' . $row['TagID'],
+                ],
+            );
+        }
+
+        return new Component($transformations);
     }
 
     /**
@@ -253,6 +281,7 @@ class Flarum extends Target
             'CountComments' => ['comment_count', 'last_post_number', 'post_number_index'],
             'Announce' => 'is_sticky', // Flarum doesn't mind if this is '2' so straight map it.
             'Closed' => 'is_locked',
+            'is_approved=1',
             'CountViews' => 'view_count', // flarumite/simple-discussion-views
             'is_private=0',
             'votes=0',
@@ -289,6 +318,20 @@ class Flarum extends Target
             ->leftJoin('Category', 'Discussion.CategoryID', '=', 'Category.CategoryID')
             ->whereNotNull('ParentCategoryID');
         $this->import('discussion_tag', $query, $map);
+
+        if ($this->importSourceTags && $this->hasPortSchema('TagDiscussion')) {
+            $this->import(
+                'discussion_tag',
+                $this->porterQB()->from('TagDiscussion')->select(),
+                [
+                    'DiscussionID' => 'discussion_id',
+                    'TagID' => 'tag_id',
+                ],
+                [
+                    'TagID' => fn($val) => $val + $this->tagIdOffset,
+                ],
+            );
+        }
     }
 
     /** Requires addon `flarum/subscriptions` */
@@ -323,6 +366,7 @@ class Flarum extends Target
             'DateUpdated' => 'edited_at',
             'UpdateUserID' => 'edited_user_id',
             'Body' => 'content',
+            'is_approved=1',
             'type=comment',
         ];
         $filters = [
@@ -362,6 +406,7 @@ class Flarum extends Target
             'Type' => 'type',
             'Path' => 'path',
             'Name' => 'base_name',
+            'DateInserted' => 'created_at',
         ];
         $filters = [
             'ForeignID' => function ($val, $col, $row) {
@@ -379,7 +424,7 @@ class Flarum extends Target
             'Name' => fn ($val, $col, $row) => !empty(substr($val, -220)) ? substr($val, -220) : 'untitled',
             'DateInserted' => Filter\EmptyToDate::class,
             // @todo 'url' can only be a relative path today.
-            'url' => fn ($val, $col, $row) => '/' .  self::INFO['attachmentPath'] . '/' . ltrim($row['Path'], '/'),
+            'url' => fn ($val, $col, $row) => '/assets/files/' . ltrim($row['Path'], '/'),
             // @see packages/upload/src/Providers/DownloadProvider.php
             'tag' => fn ($val, $col, $row) => (str_starts_with($row['Type'], 'image/')) ? 'image-preview' : 'file',
         ];
@@ -433,16 +478,21 @@ class Flarum extends Target
             'DiscussionID' => 'discussion_id',
             'CommentID' => 'post_id',
             'InsertUserID' => 'user_id',
-            'DateInserted' => ['created_at', 'end_date'],
+            'DateInserted' => 'created_at',
+            'DateClosed' => 'end_date',
             'DateUpdated' => 'updated_at',
             'CountVotes' => 'vote_count',
-            'settings={}', // cannot be null
-            'Anonymous' => 'public_poll',
+            'AllowMultiple' => 'settings',
         ];
         $filters = [
             'CountVotes' => \Porter\Filter\EmptyToZero::class,
-            // Whether its public or anonymous are inverse conditions, so flip the value.
-            'Anonymous' => fn($val, $col, $row) => $val > 0 ? 0 : 1,
+            'AllowMultiple' => fn($val, $col, $row) => json_encode([
+                'public_poll' => empty($row['Anonymous']),
+                'allow_multiple_votes' => (bool)$val,
+                'max_votes' => $val ? max(0, (int)($row['MaxVotes'] ?? 0)) : 0,
+                'hide_votes' => !empty($row['HideVotes']),
+                'allow_change_vote' => !empty($row['AllowChangeVote']),
+            ], JSON_THROW_ON_ERROR),
         ];
         $query = $this->porterQB()->from('Poll')->select();
         $this->import('polls', $query, $map, $filters);
@@ -532,12 +582,19 @@ class Flarum extends Target
 
         // Messages — Discussions
         $MaxDiscussionID = $this->getMaxValue('id', 'discussions');
+        $MaxCommentID = $this->getMaxValue('id', 'posts');
+        $this->messagePostOffset = $MaxCommentID;
         Log::comment('Discussions offset for PMs is ' . $MaxDiscussionID);
         $this->setSchema('discussions', $this->getFlarumDiscussionSchema());
         $map = [
             'ConversationID' => ['id', 'slug'],
             'InsertUserID' => 'user_id',
-            'DateInserted' => ['created_at', 'last_posted_at'], // @todo Orders old PMs by OP instead of last comment.
+            'FirstMessageID' => 'first_post_id',
+            'LastMessageID' => 'last_post_id',
+            'DateInserted' => 'created_at',
+            'DateUpdated' => 'last_posted_at',
+            'UpdateUserID' => 'last_posted_user_id',
+            'CountMessages' => 'comment_count',
             'post_number_index=0',
             'is_sticky=0',
             'is_locked=0',
@@ -546,20 +603,26 @@ class Flarum extends Target
             'hotness=0', // Hedge against fof/gamification
             'view_count=0',
             'best_answer_notified=1', // fof/best-answer
+            'is_approved=1',
             'Subject' => 'title',
         ];
         $filters = [
             'ConversationID' => function ($val, $col, $row) use ($MaxDiscussionID) {
                 return $val + $MaxDiscussionID;
             },
-            'Subject' => fn($val, $col, $row) => $val ?? // Use generic numbered title if no Subject line.
-                "Private discussion " . ($row['ConversationID'] + $MaxDiscussionID),
+            'FirstMessageID' => fn($val) => $val + $this->messagePostOffset,
+            'LastMessageID' => fn($val) => $val + $this->messagePostOffset,
+            'CountMessages' => fn($val) => max(0, (int)$val - 1),
+            'Subject' => fn($val, $col, $row) => mb_substr(
+                $val ?? "Private discussion " . ($row['ConversationID'] + $MaxDiscussionID),
+                0,
+                200,
+            ),
         ];
         $query = $this->porterQB()->from('Conversation')->select();
         $this->import('discussions', $query, $map, $filters);
 
         // Messages — Comments
-        $MaxCommentID = $this->messagePostOffset = $this->getMaxValue('id', 'posts');
         Log::comment('Posts offset for PMs is ' . $MaxCommentID);
         $map = [
             'MessageID' => 'id',
@@ -568,6 +631,7 @@ class Flarum extends Target
             'InsertUserID' => 'user_id',
             'DateInserted' => 'created_at',
             'is_private=1',
+            'is_approved=1',
             'type=comment'
         ];
         $filters = [
