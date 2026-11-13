@@ -49,6 +49,11 @@ class Flarum extends Target
     /** @var int Offset for inserting PMs into posts table. */
     protected int $messagePostOffset = 0;
 
+    /** @var int Offset for source tags so they do not collide with forum tags. */
+    protected int $tagIdOffset = 0;
+
+    protected bool $importSourceTags = false;
+
     /** Standard precheck for issues that will break the import. */
     public function validate(): void
     {
@@ -209,7 +214,7 @@ class Flarum extends Target
     /** 'Tags' in Flarum. */
     protected function categories(): Component
     {
-        return new Component([
+        $transformations = [
             new Transformation(
                 outputSchemaName: 'tags',
                 data: $this->porterQB()->from('Category')->select()
@@ -232,7 +237,30 @@ class Flarum extends Target
                     'ParentCategoryID' => fn($val, $name, $row) => (-1 === $val) ? null : $val, // Root cat is null ID.
                 ],
             ),
-        ]);
+        ];
+
+        if ($this->hasPortSchema('Tag') && $this->hasPortSchema('TagDiscussion')) {
+            $this->importSourceTags = true;
+            $categoryMax = $this->porterQB()->from('Category')->max('CategoryID') ?? 0;
+            $targetMax = $this->hasOutputSchema('tags') ? $this->getMaxValue('id', 'tags') : 0;
+            $this->tagIdOffset = $targetMax + (int)$categoryMax;
+            $transformations[] = new Transformation(
+                outputSchemaName: 'tags',
+                data: 'Tag',
+                map: [
+                    'TagID' => 'id',
+                    'Name' => 'name',
+                    'FullName' => 'slug',
+                ],
+                filters: [
+                    'TagID' => fn($val) => $val + $this->tagIdOffset,
+                    'FullName' => fn($val, $name, $row) =>
+                        Formatter::instance()->toUrl($val ?? $row['Name'] ?? 'tag') . '-' . $row['TagID'],
+                ],
+            );
+        }
+
+        return new Component($transformations);
     }
 
     /**
@@ -289,6 +317,20 @@ class Flarum extends Target
             ->leftJoin('Category', 'Discussion.CategoryID', '=', 'Category.CategoryID')
             ->whereNotNull('ParentCategoryID');
         $this->import('discussion_tag', $query, $map);
+
+        if ($this->importSourceTags && $this->hasPortSchema('TagDiscussion')) {
+            $this->import(
+                'discussion_tag',
+                $this->porterQB()->from('TagDiscussion')->select(),
+                [
+                    'DiscussionID' => 'discussion_id',
+                    'TagID' => 'tag_id',
+                ],
+                [
+                    'TagID' => fn($val) => $val + $this->tagIdOffset,
+                ],
+            );
+        }
     }
 
     /** Requires addon `flarum/subscriptions` */
@@ -433,16 +475,21 @@ class Flarum extends Target
             'DiscussionID' => 'discussion_id',
             'CommentID' => 'post_id',
             'InsertUserID' => 'user_id',
-            'DateInserted' => ['created_at', 'end_date'],
+            'DateInserted' => 'created_at',
+            'DateClosed' => 'end_date',
             'DateUpdated' => 'updated_at',
             'CountVotes' => 'vote_count',
-            'settings={}', // cannot be null
-            'Anonymous' => 'public_poll',
+            'AllowMultiple' => 'settings',
         ];
         $filters = [
             'CountVotes' => \Porter\Filter\EmptyToZero::class,
-            // Whether its public or anonymous are inverse conditions, so flip the value.
-            'Anonymous' => fn($val, $col, $row) => $val > 0 ? 0 : 1,
+            'AllowMultiple' => fn($val, $col, $row) => json_encode([
+                'public_poll' => empty($row['Anonymous']),
+                'allow_multiple_votes' => (bool)$val,
+                'max_votes' => $val ? max(0, (int)($row['MaxVotes'] ?? 0)) : 0,
+                'hide_votes' => !empty($row['HideVotes']),
+                'allow_change_vote' => !empty($row['AllowChangeVote']),
+            ], JSON_THROW_ON_ERROR),
         ];
         $query = $this->porterQB()->from('Poll')->select();
         $this->import('polls', $query, $map, $filters);
