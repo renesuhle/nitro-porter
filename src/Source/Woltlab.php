@@ -139,12 +139,23 @@ class WoltLab extends Source
 
     protected function discussions(): void
     {
-        $query = $this->sourceQB()->fromRaw($this->forumTable('thread') . ' as t')
+        $threadAlias = $this->forumAlias('t');
+        $firstPostAlias = $this->forumAlias('firstPost');
+        $firstPostQuery = $this->sourceQB()->fromRaw(
+            $this->forumTable('post') . ' as ' . $firstPostAlias
+        )
+            ->select('firstPost.postID')
+            ->whereColumn('firstPost.threadID', 't.threadID')
+            ->where('firstPost.isDeleted', '=', 0)
+            ->where('firstPost.isDisabled', '=', 0)
+            ->orderBy('firstPost.time')
+            ->orderBy('firstPost.postID')
+            ->limit(1);
+        $query = $this->sourceQB()->fromRaw($this->forumTable('thread') . ' as ' . $this->forumAlias('t'))
             ->select([
                 't.threadID',
                 't.boardID',
                 't.topic',
-                't.firstPostID',
                 't.time',
                 't.userID',
                 't.lastPostID',
@@ -153,14 +164,15 @@ class WoltLab extends Source
                 't.isSticky',
                 't.isClosed',
             ])
-            ->selectRaw('coalesce(nullif(t.lastPostTime, 0), t.time) as lastPostTime')
-            ->selectRaw('coalesce(nullif(t.lastPosterID, 0), t.userID) as lastPosterID')
+            ->selectSub($firstPostQuery, 'firstPostID')
+            ->selectRaw("coalesce(nullif($threadAlias.lastPostTime, 0), $threadAlias.time) as lastPostTime")
+            ->selectRaw("coalesce(nullif($threadAlias.lastPosterID, 0), $threadAlias.userID) as lastPosterID")
             ->where('t.isDeleted', '=', 0)
             ->where('t.isDisabled', '=', 0)
             ->whereExists(function ($query) {
                 $query->selectRaw('1')
-                    ->fromRaw($this->forumTable('post') . ' as firstPost')
-                    ->whereColumn('firstPost.postID', 't.firstPostID')
+                    ->fromRaw($this->forumTable('post') . ' as ' . $this->forumAlias('firstPost'))
+                    ->whereColumn('firstPost.threadID', 't.threadID')
                     ->where('firstPost.isDeleted', '=', 0)
                     ->where('firstPost.isDisabled', '=', 0);
             });
@@ -194,9 +206,9 @@ class WoltLab extends Source
 
     protected function comments(): void
     {
-        $query = $this->sourceQB()->fromRaw($this->forumTable('post') . ' as p')
+        $query = $this->sourceQB()->fromRaw($this->forumTable('post') . ' as ' . $this->forumAlias('p'))
             ->join(
-                $this->dbInput()->raw($this->forumTable('thread') . ' as t'),
+                $this->dbInput()->raw($this->forumTable('thread') . ' as ' . $this->forumAlias('t')),
                 't.threadID',
                 '=',
                 'p.threadID'
@@ -262,7 +274,7 @@ class WoltLab extends Source
         $query = $this->sourceQB()->from('tag_to_object as to')
             ->join('object_type as ot', 'ot.objectTypeID', '=', 'to.objectTypeID')
             ->join(
-                $this->dbInput()->raw($this->forumTable('thread') . ' as t'),
+                $this->dbInput()->raw($this->forumTable('thread') . ' as ' . $this->forumAlias('t')),
                 't.threadID',
                 '=',
                 'to.objectID'
@@ -301,6 +313,8 @@ class WoltLab extends Source
         }
 
         $attachmentRoot = rtrim($this->getPath('attachment', true), "/\\") . DIRECTORY_SEPARATOR;
+        $attachmentAlias = $this->forumAlias('a');
+        $objectTypeAlias = $this->forumAlias('ot');
         $query = $this->sourceQB()->from('attachment as a')
             ->join('object_type as ot', 'ot.objectTypeID', '=', 'a.objectTypeID')
             ->whereIn('ot.objectType', array_merge(
@@ -313,9 +327,9 @@ class WoltLab extends Source
                         $query->whereIn('a.objectTypeID', $postTypeIDs)
                             ->whereExists(function ($query) {
                                 $query->selectRaw('1')
-                                    ->fromRaw($this->forumTable('post') . ' as p')
+                                    ->fromRaw($this->forumTable('post') . ' as ' . $this->forumAlias('p'))
                                     ->join(
-                                        $this->dbInput()->raw($this->forumTable('thread') . ' as t'),
+                                        $this->dbInput()->raw($this->forumTable('thread') . ' as ' . $this->forumAlias('t')),
                                         't.threadID',
                                         '=',
                                         'p.threadID'
@@ -354,9 +368,9 @@ class WoltLab extends Source
                 'a.width',
                 'a.height',
             ])
-            ->selectRaw("case when ot.objectType = 'com.woltlab.wbb.post' then 'Comment' else 'Message' end as foreignTable")
-            ->selectRaw('concat(left(a.fileHash, 2), "/", a.attachmentID, "-", a.fileHash) as relativePath')
-            ->selectRaw('concat(left(a.fileHash, 2), "/", a.attachmentID, "-", a.fileHash) as sourcePath');
+            ->selectRaw("case when $objectTypeAlias.objectType = 'com.woltlab.wbb.post' then 'Comment' else 'Message' end as foreignTable")
+            ->selectRaw("concat(left($attachmentAlias.fileHash, 2), '/', $attachmentAlias.attachmentID, '-', $attachmentAlias.fileHash) as relativePath")
+            ->selectRaw("concat(left($attachmentAlias.fileHash, 2), '/', $attachmentAlias.attachmentID, '-', $attachmentAlias.fileHash) as sourcePath");
 
         $this->export(
             'Media',
@@ -415,16 +429,27 @@ class WoltLab extends Source
             return;
         }
 
+        $pollAlias = $this->forumAlias('p');
+        $postAlias = $this->forumAlias('post');
+        $threadAlias = $this->forumAlias('thread');
+        $postThreadAlias = $this->forumAlias('postThread');
+        $pollFirstPostAlias = $this->forumAlias('pollFirstPost');
         $query = $this->sourceQB()->from('poll as p')
-            ->leftJoin($this->dbInput()->raw($this->forumTable('post') . ' as post'), function ($join) use ($postTypeIDs) {
+            ->leftJoin($this->dbInput()->raw(
+                $this->forumTable('post') . ' as ' . $this->forumAlias('post')
+            ), function ($join) use ($postTypeIDs) {
                 $join->on('post.postID', '=', 'p.objectID')
                     ->whereIn('p.objectTypeID', $postTypeIDs);
             })
-            ->leftJoin($this->dbInput()->raw($this->forumTable('thread') . ' as thread'), function ($join) use ($threadTypeIDs, $postTypeIDs) {
+            ->leftJoin($this->dbInput()->raw(
+                $this->forumTable('thread') . ' as ' . $this->forumAlias('thread')
+            ), function ($join) use ($threadTypeIDs, $postTypeIDs) {
                 $join->on('thread.threadID', '=', 'p.objectID')
                     ->whereIn('p.objectTypeID', $threadTypeIDs);
             })
-            ->leftJoin($this->dbInput()->raw($this->forumTable('thread') . ' as postThread'), function ($join) use ($postTypeIDs) {
+            ->leftJoin($this->dbInput()->raw(
+                $this->forumTable('thread') . ' as ' . $this->forumAlias('postThread')
+            ), function ($join) use ($postTypeIDs) {
                 $join->on('postThread.threadID', '=', 'post.threadID')
                     ->whereIn('p.objectTypeID', $postTypeIDs);
             })
@@ -442,10 +467,20 @@ class WoltLab extends Source
                 'post.postID',
                 'thread.threadID',
             ])
-            ->selectRaw('coalesce(postThread.threadID, thread.threadID) as discussionID')
-            ->selectRaw('coalesce(post.postID, thread.firstPostID) as commentID')
-            ->selectRaw('coalesce(post.userID, thread.userID, postThread.userID) as userID')
-            ->selectRaw('case when p.maxVotes > 1 then 1 else 0 end as allowMultiple');
+            ->selectRaw("coalesce($postThreadAlias.threadID, $threadAlias.threadID) as discussionID")
+            ->selectRaw(
+                "coalesce($postAlias.postID, (
+                    select $pollFirstPostAlias.postID
+                    from {$this->forumTable('post')} as $pollFirstPostAlias
+                    where $pollFirstPostAlias.threadID = $threadAlias.threadID
+                        and $pollFirstPostAlias.isDeleted = 0
+                        and $pollFirstPostAlias.isDisabled = 0
+                    order by $pollFirstPostAlias.time, $pollFirstPostAlias.postID
+                    limit 1
+                )) as commentID"
+            )
+            ->selectRaw("coalesce($postAlias.userID, $threadAlias.userID, $postThreadAlias.userID) as userID")
+            ->selectRaw("case when $pollAlias.maxVotes > 1 then 1 else 0 end as allowMultiple");
 
         $this->export(
             'Poll',
@@ -606,6 +641,11 @@ class WoltLab extends Source
             return 'wbb' . $matches[1] . '_' . $table;
         }
         return $prefix . $table;
+    }
+
+    private function forumAlias(string $alias): string
+    {
+        return $this->dbInput()->getTablePrefix() . $alias;
     }
 
     /**
