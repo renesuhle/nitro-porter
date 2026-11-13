@@ -281,6 +281,7 @@ class Flarum extends Target
             'CountComments' => ['comment_count', 'last_post_number', 'post_number_index'],
             'Announce' => 'is_sticky', // Flarum doesn't mind if this is '2' so straight map it.
             'Closed' => 'is_locked',
+            'is_approved=1',
             'CountViews' => 'view_count', // flarumite/simple-discussion-views
             'is_private=0',
             'votes=0',
@@ -365,6 +366,7 @@ class Flarum extends Target
             'DateUpdated' => 'edited_at',
             'UpdateUserID' => 'edited_user_id',
             'Body' => 'content',
+            'is_approved=1',
             'type=comment',
         ];
         $filters = [
