@@ -151,6 +151,8 @@ To use it, set the following fields in your `config.php`:
 If `source_root` & `target_root` are set, Nitro Porter will evaluate whether the source & target support file transfer.
 Supported source/target combinations are determined by the installed packages; currently Xenforo and
 WoltLab sources support file transfer to Flarum.
+Supported source/target combinations are determined by the installed packages; currently Xenforo and
+WoltLab sources support file transfer to Flarum.
 
 ### Document targets (NodeBB)
 
